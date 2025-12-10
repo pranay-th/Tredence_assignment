@@ -1,29 +1,63 @@
+# /app/engine/graph.py
 import asyncio
 import uuid
+import time
 from typing import Dict, Any, List, Optional
 from .node import NodeDef
 from .state import RunModel, RunStatus, StateModel
 from ..registry.tools import TOOLS, get_tool
 from datetime import datetime
+from ..db import save_graph, save_run, load_graph, load_run
+from ..utils.broadcaster import broadcaster
 
-# Graph is stored as a simple dict:
-# {
-#   "graph_id": str,
-#   "nodes": { "name": NodeDef dict },
-#   "edges": { "node_name": [ { "next": "node2", "cond": { "key": "x", "op": "<", "value": 10 } }, ... ] },
-#   "start_node": "profile"
-# }
-
+# In-memory cache mirrors DB for quick listing; primary store is DB via db.py
 GRAPHS: Dict[str, Dict] = {}
-RUNS: Dict[str, RunModel] = {}
+RUNS_CACHE: Dict[str, RunModel] = {}
+
+# Basic graph validation
+def validate_graph_definition(defn: Dict):
+    nodes = defn.get("nodes", {})
+    edges = defn.get("edges", {})
+    start_node = defn.get("start_node") or (next(iter(nodes)) if nodes else None)
+    if not nodes:
+        raise ValueError("Graph must contain 'nodes'")
+    if not edges:
+        raise ValueError("Graph must contain 'edges'")
+    if start_node not in nodes:
+        raise ValueError("start_node must be one of nodes")
+    # verify edges reference valid nodes
+    for src, outs in edges.items():
+        if src not in nodes:
+            raise ValueError(f"Edge source '{src}' not in nodes")
+        for o in outs:
+            nxt = o.get("next")
+            if nxt and nxt not in nodes:
+                raise ValueError(f"Edge from {src} references unknown next node '{nxt}'")
+    # simple unreachable detection (nodes not reachable from start)
+    reachable = set()
+    stack = [start_node]
+    while stack:
+        cur = stack.pop()
+        if cur in reachable:
+            continue
+        reachable.add(cur)
+        for out in edges.get(cur, []):
+            nxt = out.get("next")
+            if nxt:
+                stack.append(nxt)
+    unreachable = set(nodes.keys()) - reachable
+    if unreachable:
+        raise ValueError(f"Unreachable nodes detected: {unreachable}")
+    return True
 
 
 def create_graph(definition: Dict) -> str:
+    # validate
+    validate_graph_definition(definition)
     graph_id = str(uuid.uuid4())
-    if "nodes" not in definition or "edges" not in definition:
-        raise ValueError("Graph definition must include 'nodes' and 'edges'")
     definition["graph_id"] = graph_id
     GRAPHS[graph_id] = definition
+    save_graph(graph_id, definition)  # persist
     return graph_id
 
 
@@ -56,12 +90,12 @@ def evaluate_condition(state: StateModel, cond: Dict) -> bool:
         return actual is not None and actual >= val
     if op == "<=":
         return actual is not None and actual <= val
-    # default
     return bool(actual)
 
 
 async def run_graph_async(graph_id: str, initial_state: Dict[str, Any]) -> RunModel:
-    graph = GRAPHS.get(graph_id)
+    # load graph from DB if not in memory
+    graph = GRAPHS.get(graph_id) or load_graph(graph_id)
     if not graph:
         raise ValueError("graph not found")
     run_id = str(uuid.uuid4())
@@ -72,31 +106,52 @@ async def run_graph_async(graph_id: str, initial_state: Dict[str, Any]) -> RunMo
         state=StateModel(data=initial_state.copy()),
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
+        logs=[],
+        current_node=None,
     )
-    RUNS[run_id] = run
-
+    RUNS_CACHE[run_id] = run
+    # persist initial run
+    save_run({
+        "run_id": run_id,
+        "graph_id": graph_id,
+        "status": run.status.value,
+        "state": run.state.data,
+        "logs": run.logs,
+        "metrics": {},
+        "current_node": None
+    })
     start_node = graph.get("start_node") or list(graph["nodes"].keys())[0]
     try:
         current = start_node
         visited = 0
-        max_visits = graph.get("max_visits", 1000)  
+        max_visits = graph.get("max_visits", 1000)
+        metrics = {}
         while current:
             run.current_node = current
-            run.logs.append(f"START_NODE:{current}")
+            msg = f"START_NODE:{current}"
+            run.logs.append(msg)
+            await broadcaster.publish(run_id, msg)
             run.updated_at = datetime.utcnow()
             node_def = NodeDef(**graph["nodes"][current])
             func = get_tool(node_def.func)
             if not func:
                 raise RuntimeError(f"Tool {node_def.func} not found for node {current}")
+            start_t = time.time()
             if asyncio.iscoroutinefunction(func):
                 result = await func(run.state.data, node_def.meta)
             else:
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(None, func, run.state.data, node_def.meta)
+            elapsed = time.time() - start_t
+            metrics[current] = {"time_s": elapsed}
+            # merge result
             if isinstance(result, dict):
                 run.state.data.update(result)
-            run.logs.append(f"END_NODE:{current} -> state_snapshot:{run.state.data}")
+            end_msg = f"END_NODE:{current} elapsed={elapsed:.4f} state_snapshot={run.state.data}"
+            run.logs.append(end_msg)
+            await broadcaster.publish(run_id, end_msg)
             run.updated_at = datetime.utcnow()
+            # determine next
             edge_options = graph["edges"].get(current, [])
             next_node: Optional[str] = None
             for opt in edge_options:
@@ -113,45 +168,118 @@ async def run_graph_async(graph_id: str, initial_state: Dict[str, Any]) -> RunMo
                 raise RuntimeError("Max visits exceeded; possible infinite loop")
         run.status = RunStatus.SUCCESS
         run.logs.append("RUN_COMPLETE")
+        await broadcaster.publish(run_id, "RUN_COMPLETE")
         run.current_node = None
         run.updated_at = datetime.utcnow()
+        run.metrics = metrics
+        # persist final run
+        save_run({
+            "run_id": run_id,
+            "graph_id": graph_id,
+            "status": run.status.value,
+            "state": run.state.data,
+            "logs": run.logs,
+            "metrics": run.metrics,
+            "current_node": run.current_node,
+        })
     except Exception as e:
         run.status = RunStatus.FAILED
-        run.logs.append(f"ERR:{repr(e)}")
+        err = f"ERR:{repr(e)}"
+        run.logs.append(err)
+        await broadcaster.publish(run_id, err)
         run.updated_at = datetime.utcnow()
+        save_run({
+            "run_id": run_id,
+            "graph_id": graph_id,
+            "status": run.status.value,
+            "state": run.state.data,
+            "logs": run.logs,
+            "metrics": {},
+            "current_node": run.current_node,
+        })
     return run
 
 
 def start_run_background(graph_id: str, initial_state: Dict[str, Any]) -> str:
-    import asyncio
     run_id = str(uuid.uuid4())
-    run = RunModel(
+    # create placeholder run in DB and cache
+    placeholder = RunModel(
         run_id=run_id,
         graph_id=graph_id,
         status=RunStatus.PENDING,
         state=StateModel(data=initial_state.copy()),
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
+        logs=[],
+        current_node=None,
     )
-    RUNS[run_id] = run
+    RUNS_CACHE[run_id] = placeholder
+    save_run({
+        "run_id": run_id,
+        "graph_id": graph_id,
+        "status": placeholder.status.value,
+        "state": placeholder.state.data,
+        "logs": [],
+        "metrics": {},
+        "current_node": None
+    })
 
     async def _runner():
         try:
-            RUNS[run_id] = await run_graph_async(graph_id, initial_state)
+            # replace placeholder by actual run
+            actual_run = await run_graph_async(graph_id, initial_state)
+            RUNS_CACHE[run_id] = actual_run
         except Exception as e:
-            r = RUNS.get(run_id, run)
+            r = RUNS_CACHE.get(run_id, placeholder)
             r.status = RunStatus.FAILED
             r.logs.append(f"ERR:{repr(e)}")
-            r.updated_at = datetime.utcnow()
-            RUNS[run_id] = r
+            save_run({
+                "run_id": r.run_id,
+                "graph_id": r.graph_id,
+                "status": r.status.value,
+                "state": r.state.data,
+                "logs": r.logs,
+                "metrics": getattr(r, "metrics", {}),
+                "current_node": r.current_node,
+            })
+            RUNS_CACHE[run_id] = r
 
     asyncio.create_task(_runner())
     return run_id
 
 
 def get_run(run_id: str) -> RunModel | None:
-    return RUNS.get(run_id)
+    # prefer cache, fallback to DB
+    r = RUNS_CACHE.get(run_id)
+    if r:
+        return r
+    loaded = load_run(run_id)
+    if not loaded:
+        return None
+    # convert to RunModel minimally
+    rm = RunModel(
+        run_id=loaded["run_id"],
+        graph_id=loaded["graph_id"],
+        status=RunStatus(loaded["status"]),
+        state=StateModel(data=loaded.get("state", {})),
+        logs=loaded.get("logs", []),
+        current_node=loaded.get("current_node"),
+        created_at=None,
+        updated_at=None,
+    )
+    RUNS_CACHE[run_id] = rm
+    return rm
 
 
 def list_graphs() -> List[Dict]:
-    return list(GRAPHS.values())
+    # return from DB primarily
+    return load_graphs_cached()
+
+
+def load_graphs_cached() -> List[Dict]:
+    # try DB list
+    try:
+        from ..db import list_graphs_db
+        return list_graphs_db()
+    except Exception:
+        return list(GRAPHS.values())
